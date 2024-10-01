@@ -8,17 +8,17 @@ import sqlite3
 import subprocess
 import logging
 import yaml
-
+import fnmatch
+import pathlib
 from pathlib import Path
+from typing import List
 
 sfv_clean = re.compile(r"^;.*$", flags=re.M)
 sfv_pattern = re.compile(r"^\S+ [a-fA-F0-9]{8}$")
 
-
 logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s [%(levelname)7s] %(message)s"
 )
-
 
 class IncompleteChecker:
     def __init__(self, config, chain):
@@ -124,7 +124,7 @@ class IncompleteChecker:
     def path_in_config(self, path: Path, key: str):
         return any([x in str(path) for x in self.config["glftpd"].get(key, [])])
 
-    def write_log(self, message: str):
+    def write_log(self, message):
         timestamp = time.strftime("%a %b %d %T %Y", time.gmtime())
         try:
             with self.glftpd_log.open("a") as logf:
@@ -158,7 +158,7 @@ class IncompleteChecker:
         undupe_bin = self.glftpd_path / "bin" / "undupe"
         logging.info(f"Triggering undupe for {release_path.name}/{release_file}")
         subprocess.run(
-            [undupe_bin, "-r", self.glftpd_conf, "-f", release_file],
+             [undupe_bin, "-r", self.glftpd_conf, "-f", release_file],
         )
         return True
 
@@ -189,9 +189,14 @@ class IncompleteChecker:
         dirs = []
         for dirpath in path.iterdir():
             if not dirpath.is_dir() or dirpath.is_symlink():
-                continue
+                 continue
             if self.daydir_re.match(dirpath.name):
-                dirs += self.get_dirs(dirpath)
+                 for subdir in dirpath.iterdir():
+                     if subdir.is_dir():
+                         for moar in subdir.iterdir():
+                             if subdir.is_dir() and not self.complete_re.match(subdir.name):
+                                 dirs += self.get_dirs(moar)
+
             elif self.nuke_re.match(dirpath.name):
                 continue
             elif self.path_in_config(dirpath, "skip_paths"):
@@ -205,7 +210,7 @@ class IncompleteChecker:
         group = self.groups.get(gid, "unknown")
         return user, group
 
-    def run(self) -> [str]:
+    def run(self) -> List[str]:
         paths = []
         messages = []
 
@@ -219,7 +224,6 @@ class IncompleteChecker:
                 message = f"    {site_path}/\002{release}\002 lacks \002{'/'.join(reasons)}\002, was sent by \002{user}\002/{group}"
                 messages.append(message)
 
-        # dead symlink removal
         for path in self.incompletes_path.iterdir():
             if path.is_symlink() and not path.is_dir():
                 path.unlink()
@@ -235,7 +239,6 @@ class IncompleteChecker:
         link_path = self.incompletes_path / release
 
         if (time.time() - self.get_release_age(release_path)) < 60:
-            # this release is merely 1min old and might still be raced so let's just leave it
             return dirpath_announce, release, reasons, "", ""
 
         with self.conn:
@@ -247,7 +250,6 @@ class IncompleteChecker:
             release_info = cursor.fetchone()
             if release_info:
                 if release_info["processed"] == 1:
-                    # we already checked this!
                     if link_path.is_symlink():
                         link_path.unlink()
                     return dirpath_announce, release, reasons, "", ""
@@ -261,7 +263,6 @@ class IncompleteChecker:
                     return dirpath_announce, release, reasons, "", ""
 
         if self.special_re.search(release):
-            # this release is a *fix* release of some sort, there is hopefully no need to check these
             with self.conn:
                 self.conn.execute(
                     "INSERT INTO Releases (timestamp, release, path, incomplete, approved, processed) VALUES (?, ?, ?, ?, ?, ?);",
@@ -272,7 +273,6 @@ class IncompleteChecker:
         try:
             dir_info = release_path.stat()
         except OSError:
-            # autowipe or move must've taken care of this dir in the meantime
             return dirpath_announce, release, reasons, "", ""
         uid = dir_info.st_uid
         gid = dir_info.st_gid
@@ -301,11 +301,9 @@ class IncompleteChecker:
                     is_complete = False
                     complete_dirs.append(path)
                     if is_root:
-                        # root of the release is incomplete
-                        reasons.append("completeness")
+                        reasons.append("is currently incomplete!")
                     else:
-                        # subdir inside the release is incomplete
-                        reasons.append(f"{subdir_name} completeness")
+                        reasons.append(f"/{subdir_name} appears to be incomplete!")
 
             if is_root or subdir_name in ["subs"]:
                 for file in [path / f for f in files]:
@@ -313,7 +311,6 @@ class IncompleteChecker:
                         if is_root:
                             nfo += 1
                         else:
-                            # clean up junk files
                             file.unlink()
                     elif file.suffix.lower() == ".sfv":
                         sfv += 1
@@ -331,9 +328,9 @@ class IncompleteChecker:
                         self.undupe(path, file.name.replace("-missing", ""))
 
                 if is_root and nfo == 0 and not self.fix_check(dirpath, release):
-                    reasons.append("nfo")
-                if is_root and sfv == 0:
-                    reasons.append("sfv")
+                    reasons.append("missing the \037nfo\037!")
+                if is_root and sfv == 0 and not any(fnmatch.fnmatch(release, pattern) for pattern in ["*COMPLETE*"]):
+                   reasons.append("missing the \037sfv\037!")
                 elif not is_root and sfv == 0:
                     reasons.append(subdir_name)
 
@@ -342,7 +339,6 @@ class IncompleteChecker:
                     if file.suffix.lower() in (".avi", ".m2ts", ".mkv", ".mp4", ".vob", ".wmv"):
                         sample += 1
                     elif file.suffix.lower() in (".jpeg", ".jpg", ".png"):
-                        # proof pics or such for propers
                         continue
                     else:
                         logging.debug(
@@ -362,20 +358,16 @@ class IncompleteChecker:
                     ):
                         proof += 1
                 if proof == 0 and not self.fix_check(dirpath, release):
-                    reasons.append("file in proof")
+                    reasons.append("\037empty\037 proof dir!")
 
             if sfv > 0 and path not in complete_dirs:
-                # we have sfv files but no complete/incomplete dir in the folder, maybe zipscript crapped out?
-                # rescan and re-check the next time around
                 self.rescan(path)
                 rescanned = True
             elif is_root and zips > 0 and sfv == 0:
-                # zipscript probably failed to unpack diz during race, rescan to try and unpack it
                 self.rescan(path)
                 rescanned = True
 
             if is_complete is not None and not is_complete and not rescanned:
-                # zipscript says it's complete but a file is missing, or zipscript says it's incomplete
                 logging.info(f"Rescanning {path} because it is incomplete!")
                 self.rescan(path)
                 rescanned = True
@@ -386,7 +378,6 @@ class IncompleteChecker:
             and not self.path_in_config(dirpath, "no_sample_paths")
         ):
             reasons.append("sample")
-
         user, group = self.get_user_group(uid, gid)
         if len(reasons):
             if self.path_in_config(dirpath, "mask_userinfo_paths"):
@@ -427,7 +418,6 @@ class IncompleteChecker:
 
         return dirpath_announce, release, reasons, user, group
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("config", help="path to config file")
@@ -443,8 +433,7 @@ if __name__ == "__main__":
 
     chain = args.chain if args.chain else config["chain"]
     if not re.search(r"^[a-zA-Z0-9]+$", chain):
-        print(
-            f"ERROR: You need to provide a valid output chain - provided chain {chain} is invalid"
+        print(            f"ERROR: You need to provide a valid output chain - provided chain {chain} is invalid"
         )
         exit(1)
 
@@ -455,7 +444,7 @@ if __name__ == "__main__":
         for message in messages:
             logging.info(message)
     elif len(messages):
-        checker.write_log("Please complete the following releases:")
         for message in messages:
-            checker.write_log(message)
-            time.sleep(0.5)
+            lines = message.split('\n')
+            for line in lines:
+                checker.write_log(line)
